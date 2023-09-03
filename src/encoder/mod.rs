@@ -7,7 +7,7 @@ use std::{
     io::{self, Seek, Write},
     marker::PhantomData,
     mem,
-    num::TryFromIntError,
+    num::TryFromIntError, vec,
 };
 
 use crate::{
@@ -92,7 +92,7 @@ impl<W: Write + Seek, K: TiffKind> TiffEncoder<W, K> {
     }
 
     /// Create a [`DirectoryEncoder`] to encode an ifd directory.
-    pub fn new_directory<C, D>(&mut self) -> TiffResult<DirectoryEncoder<W, K, C, D>> where C: ColorType, D: Compression {
+    pub fn new_directory<C, D, CT>(&mut self) -> TiffResult<DirectoryEncoder<W, K, C, D, CT>> where C: ColorType, D: Compression, CT: ChunkType {
         DirectoryEncoder::new(&mut self.writer)
     }
 
@@ -150,11 +150,58 @@ impl<W: Write + Seek, K: TiffKind> TiffEncoder<W, K> {
     }
 }
 
+pub trait ChunkType {
+    fn get_chunk_count(&self, height: u32) -> u64;
+    fn get_chunk_offsets(&self, height: u32) -> Vec<u64>;
+    fn get_chunk_byte_counts(&self, height: u32) -> Vec<u64>;
+}
+
+
+pub struct StripedChunk {
+    offset: u64,
+    byte_count: u64,
+}
+
+impl ChunkType for StripedChunk {
+    fn get_chunk_count(&self, height: u32) -> u64 {
+        unimplemented!();
+    }
+
+    fn get_chunk_offsets(&self, height: u32) -> Vec<u64> {
+        unimplemented!();
+    }
+
+    fn get_chunk_byte_counts(&self, height: u32) -> Vec<u64> {
+        unimplemented!();
+    }
+}
+
+pub struct TiledChunk {
+    offset: u64,
+    byte_count: u64,
+    width: u32,
+    height: u32,
+}
+
+impl ChunkType for TiledChunk {
+    fn get_chunk_count(&self, height: u32) -> u64 {
+        unimplemented!();
+    }
+
+    fn get_chunk_offsets(&self, height: u32) -> Vec<u64> {
+        unimplemented!();
+    }
+
+    fn get_chunk_byte_counts(&self, height: u32) -> Vec<u64> {
+        unimplemented!();
+    }
+}
+
 /// Low level interface to encode ifd directories.
 ///
 /// You should call `finish` on this when you are finished with it.
 /// Encoding can silently fail while this is dropping.
-pub struct DirectoryEncoder<'a, W: 'a + Write + Seek, K: TiffKind, C: ColorType, D: Compression> {
+pub struct DirectoryEncoder<'a, W: 'a + Write + Seek, K: TiffKind, C: ColorType, D: Compression, CT: ChunkType> {
     writer: &'a mut TiffWriter<W>,
     dropped: bool,
     // We use BTreeMap to make sure tags are written in correct order
@@ -162,9 +209,10 @@ pub struct DirectoryEncoder<'a, W: 'a + Write + Seek, K: TiffKind, C: ColorType,
     ifd: BTreeMap<u16, DirectoryEntry<K::OffsetType>>,
     phantomcolor: PhantomData<C>,
     phantomcompression: PhantomData<D>,
+    phantomchunk: PhantomData<CT>,
 }
 
-impl<'a, W: 'a + Write + Seek, K: TiffKind, C: ColorType, D: Compression> DirectoryEncoder<'a, W, K, C, D> {
+impl<'a, W: 'a + Write + Seek, K: TiffKind, C: ColorType, D: Compression, CT: ChunkType> DirectoryEncoder<'a, W, K, C, D, CT> {
     fn new(writer: &'a mut TiffWriter<W>) -> TiffResult<Self> {
         // the previous word is the IFD offset position
         let ifd_pointer_pos = writer.offset() - mem::size_of::<K::OffsetType>() as u64;
@@ -176,6 +224,7 @@ impl<'a, W: 'a + Write + Seek, K: TiffKind, C: ColorType, D: Compression> Direct
             ifd: BTreeMap::new(),
             phantomcolor: PhantomData,
             phantomcompression: PhantomData,
+            phantomchunk: PhantomData,
         })
     }
 
@@ -276,7 +325,7 @@ impl<'a, W: 'a + Write + Seek, K: TiffKind, C: ColorType, D: Compression> Direct
     }
 }
 
-impl<'a, W: Write + Seek, K: TiffKind, C: ColorType, D: Compression> Drop for DirectoryEncoder<'a, W, K, C, D> {
+impl<'a, W: Write + Seek, K: TiffKind, C: ColorType, D: Compression, CT: ChunkType> Drop for DirectoryEncoder<'a, W, K, C, D, CT> {
     fn drop(&mut self) {
         if !self.dropped {
             let _ = self.finish_internal();
@@ -323,8 +372,9 @@ pub struct ImageEncoder<
     C: ColorType,
     K: TiffKind,
     D: Compression = Uncompressed,
+    CT: ChunkType = StripedChunk,
 > {
-    encoder: DirectoryEncoder<'a, W, K, C, D>,
+    encoder: DirectoryEncoder<'a, W, K, C, D, CT>,
     chunk_idx: u64,
     chunk_count: u64,
     row_samples: u64,
@@ -338,10 +388,10 @@ pub struct ImageEncoder<
     _phantom: ::std::marker::PhantomData<C>,
 }
 
-impl<'a, W: 'a + Write + Seek, T: ColorType, K: TiffKind, D: Compression>
-    ImageEncoder<'a, W, T, K, D>
+impl<'a, W: 'a + Write + Seek, T: ColorType, K: TiffKind, D: Compression, CT: ChunkType>
+    ImageEncoder<'a, W, T, K, D, CT>
 {
-    fn new(encoder: DirectoryEncoder<'a, W, K, T, D>, width: u32, height: u32) -> TiffResult<Self>
+    fn new(encoder: DirectoryEncoder<'a, W, K, T, D, CT>, width: u32, height: u32) -> TiffResult<Self>
     where
         D: Default,
     {
@@ -349,7 +399,7 @@ impl<'a, W: 'a + Write + Seek, T: ColorType, K: TiffKind, D: Compression>
     }
 
     fn with_compression(
-        mut encoder: DirectoryEncoder<'a, W, K, T, D>,
+        mut encoder: DirectoryEncoder<'a, W, K, T, D, CT>,
         width: u32,
         height: u32,
         compression: D,
@@ -547,7 +597,7 @@ impl<'a, W: 'a + Write + Seek, T: ColorType, K: TiffKind, D: Compression>
     }
 
     /// Get a reference of the underlying `DirectoryEncoder`
-    pub fn encoder(&mut self) -> &mut DirectoryEncoder<'a, W, K, T, D> {
+    pub fn encoder(&mut self) -> &mut DirectoryEncoder<'a, W, K, T, D, CT> {
         &mut self.encoder
     }
 
@@ -557,8 +607,8 @@ impl<'a, W: 'a + Write + Seek, T: ColorType, K: TiffKind, D: Compression>
     }
 }
 
-impl<'a, W: Write + Seek, C: ColorType, K: TiffKind, D: Compression> Drop
-    for ImageEncoder<'a, W, C, K, D>
+impl<'a, W: Write + Seek, C: ColorType, K: TiffKind, D: Compression, CT: ChunkType> Drop
+    for ImageEncoder<'a, W, C, K, D, CT>
 {
     fn drop(&mut self) {
         if !self.dropped {
