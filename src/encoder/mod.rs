@@ -92,7 +92,7 @@ impl<W: Write + Seek, K: TiffKind> TiffEncoder<W, K> {
     }
 
     /// Create a [`DirectoryEncoder`] to encode an ifd directory.
-    pub fn new_directory(&mut self) -> TiffResult<DirectoryEncoder<W, K>> {
+    pub fn new_directory<C, D>(&mut self) -> TiffResult<DirectoryEncoder<W, K, C, D>> where C: ColorType, D: Compression {
         DirectoryEncoder::new(&mut self.writer)
     }
 
@@ -154,15 +154,17 @@ impl<W: Write + Seek, K: TiffKind> TiffEncoder<W, K> {
 ///
 /// You should call `finish` on this when you are finished with it.
 /// Encoding can silently fail while this is dropping.
-pub struct DirectoryEncoder<'a, W: 'a + Write + Seek, K: TiffKind> {
+pub struct DirectoryEncoder<'a, W: 'a + Write + Seek, K: TiffKind, C: ColorType, D: Compression> {
     writer: &'a mut TiffWriter<W>,
     dropped: bool,
     // We use BTreeMap to make sure tags are written in correct order
     ifd_pointer_pos: u64,
     ifd: BTreeMap<u16, DirectoryEntry<K::OffsetType>>,
+    phantomcolor: PhantomData<C>,
+    phantomcompression: PhantomData<D>,
 }
 
-impl<'a, W: 'a + Write + Seek, K: TiffKind> DirectoryEncoder<'a, W, K> {
+impl<'a, W: 'a + Write + Seek, K: TiffKind, C: ColorType, D: Compression> DirectoryEncoder<'a, W, K, C, D> {
     fn new(writer: &'a mut TiffWriter<W>) -> TiffResult<Self> {
         // the previous word is the IFD offset position
         let ifd_pointer_pos = writer.offset() - mem::size_of::<K::OffsetType>() as u64;
@@ -172,6 +174,8 @@ impl<'a, W: 'a + Write + Seek, K: TiffKind> DirectoryEncoder<'a, W, K> {
             dropped: false,
             ifd_pointer_pos,
             ifd: BTreeMap::new(),
+            phantomcolor: PhantomData,
+            phantomcompression: PhantomData,
         })
     }
 
@@ -272,7 +276,7 @@ impl<'a, W: 'a + Write + Seek, K: TiffKind> DirectoryEncoder<'a, W, K> {
     }
 }
 
-impl<'a, W: Write + Seek, K: TiffKind> Drop for DirectoryEncoder<'a, W, K> {
+impl<'a, W: Write + Seek, K: TiffKind, C: ColorType, D: Compression> Drop for DirectoryEncoder<'a, W, K, C, D> {
     fn drop(&mut self) {
         if !self.dropped {
             let _ = self.finish_internal();
@@ -320,15 +324,15 @@ pub struct ImageEncoder<
     K: TiffKind,
     D: Compression = Uncompressed,
 > {
-    encoder: DirectoryEncoder<'a, W, K>,
-    strip_idx: u64,
-    strip_count: u64,
+    encoder: DirectoryEncoder<'a, W, K, C, D>,
+    chunk_idx: u64,
+    chunk_count: u64,
     row_samples: u64,
     width: u32,
     height: u32,
     rows_per_strip: u64,
-    strip_offsets: Vec<K::OffsetType>,
-    strip_byte_count: Vec<K::OffsetType>,
+    chunk_offsets: Vec<K::OffsetType>,
+    chunk_byte_counts: Vec<K::OffsetType>,
     dropped: bool,
     compression: D,
     _phantom: ::std::marker::PhantomData<C>,
@@ -337,7 +341,7 @@ pub struct ImageEncoder<
 impl<'a, W: 'a + Write + Seek, T: ColorType, K: TiffKind, D: Compression>
     ImageEncoder<'a, W, T, K, D>
 {
-    fn new(encoder: DirectoryEncoder<'a, W, K>, width: u32, height: u32) -> TiffResult<Self>
+    fn new(encoder: DirectoryEncoder<'a, W, K, T, D>, width: u32, height: u32) -> TiffResult<Self>
     where
         D: Default,
     {
@@ -345,7 +349,7 @@ impl<'a, W: 'a + Write + Seek, T: ColorType, K: TiffKind, D: Compression>
     }
 
     fn with_compression(
-        mut encoder: DirectoryEncoder<'a, W, K>,
+        mut encoder: DirectoryEncoder<'a, W, K, T, D>,
         width: u32,
         height: u32,
         compression: D,
@@ -391,14 +395,14 @@ impl<'a, W: 'a + Write + Seek, T: ColorType, K: TiffKind, D: Compression>
 
         Ok(ImageEncoder {
             encoder,
-            strip_count,
-            strip_idx: 0,
+            chunk_count: strip_count,
+            chunk_idx: 0,
             row_samples,
             rows_per_strip,
             width,
             height,
-            strip_offsets: Vec::new(),
-            strip_byte_count: Vec::new(),
+            chunk_offsets: Vec::new(),
+            chunk_byte_counts: Vec::new(),
             dropped: false,
             compression: compression,
             _phantom: ::std::marker::PhantomData,
@@ -407,11 +411,11 @@ impl<'a, W: 'a + Write + Seek, T: ColorType, K: TiffKind, D: Compression>
 
     /// Number of samples the next strip should have.
     pub fn next_strip_sample_count(&self) -> u64 {
-        if self.strip_idx >= self.strip_count {
+        if self.chunk_idx >= self.chunk_count {
             return 0;
         }
 
-        let raw_start_row = self.strip_idx * self.rows_per_strip;
+        let raw_start_row = self.chunk_idx * self.rows_per_strip;
         let start_row = cmp::min(u64::from(self.height), raw_start_row);
         let end_row = cmp::min(u64::from(self.height), raw_start_row + self.rows_per_strip);
 
@@ -436,10 +440,10 @@ impl<'a, W: 'a + Write + Seek, T: ColorType, K: TiffKind, D: Compression>
         let offset = self.encoder.write_data(value)?;
         let byte_count = self.encoder.last_written() as usize;
 
-        self.strip_offsets.push(K::convert_offset(offset)?);
-        self.strip_byte_count.push(byte_count.try_into()?);
+        self.chunk_offsets.push(K::convert_offset(offset)?);
+        self.chunk_byte_counts.push(byte_count.try_into()?);
 
-        self.strip_idx += 1;
+        self.chunk_idx += 1;
         Ok(())
     }
 
@@ -513,7 +517,7 @@ impl<'a, W: 'a + Write + Seek, T: ColorType, K: TiffKind, D: Compression>
     /// This function needs to be called before any calls to `write_data` or
     /// `write_strip` and will return an error otherwise.
     pub fn rows_per_strip(&mut self, value: u32) -> TiffResult<()> {
-        if self.strip_idx != 0 {
+        if self.chunk_idx != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Cannot change strip size after data was written",
@@ -524,7 +528,7 @@ impl<'a, W: 'a + Write + Seek, T: ColorType, K: TiffKind, D: Compression>
         self.encoder.write_tag(Tag::RowsPerStrip, value)?;
 
         let value: u64 = value as u64;
-        self.strip_count = (self.height as u64 + value - 1) / value;
+        self.chunk_count = (self.height as u64 + value - 1) / value;
         self.rows_per_strip = value;
 
         Ok(())
@@ -532,10 +536,10 @@ impl<'a, W: 'a + Write + Seek, T: ColorType, K: TiffKind, D: Compression>
 
     fn finish_internal(&mut self) -> TiffResult<()> {
         self.encoder
-            .write_tag(Tag::StripOffsets, K::convert_slice(&self.strip_offsets))?;
+            .write_tag(Tag::StripOffsets, K::convert_slice(&self.chunk_offsets))?;
         self.encoder.write_tag(
             Tag::StripByteCounts,
-            K::convert_slice(&self.strip_byte_count),
+            K::convert_slice(&self.chunk_byte_counts),
         )?;
         self.dropped = true;
 
@@ -543,7 +547,7 @@ impl<'a, W: 'a + Write + Seek, T: ColorType, K: TiffKind, D: Compression>
     }
 
     /// Get a reference of the underlying `DirectoryEncoder`
-    pub fn encoder(&mut self) -> &mut DirectoryEncoder<'a, W, K> {
+    pub fn encoder(&mut self) -> &mut DirectoryEncoder<'a, W, K, T, D> {
         &mut self.encoder
     }
 
