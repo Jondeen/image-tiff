@@ -257,7 +257,8 @@ impl Value {
                     new_vec.push(v.into_u64()?)
                 }
                 Ok(new_vec)
-            }
+            },
+            Short(val) => Ok(vec![val.into()]),
             Unsigned(val) => Ok(vec![val.into()]),
             UnsignedBig(val) => Ok(vec![val]),
             Rational(numerator, denominator) => Ok(vec![numerator.into(), denominator.into()]),
@@ -404,7 +405,7 @@ impl Entry {
                 Type::BYTE => Unsigned(u32::from(self.offset[0])),
                 Type::SBYTE => Signed(i32::from(self.offset[0] as i8)),
                 Type::UNDEFINED => Byte(self.offset[0]),
-                Type::SHORT => Unsigned(u32::from(self.r(bo).read_u16()?)),
+                Type::SHORT => Short(u16::from(self.r(bo).read_u16()?)),
                 Type::SSHORT => Signed(i32::from(self.r(bo).read_i16()?)),
                 Type::LONG => Unsigned(self.r(bo).read_u32()?),
                 Type::SLONG => Signed(self.r(bo).read_i32()?),
